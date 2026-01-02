@@ -1,9 +1,8 @@
 import os
 import json
 import asyncio
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional, Any
 
 import discord
 from discord.ext import commands
@@ -11,251 +10,290 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+def _env_int(name: str) -> int:
+    v = os.getenv(name)
+    if not v or not v.isdigit():
+        raise RuntimeError(f"Missing/invalid {name} in .env")
+    return int(v)
+
 TOKEN = os.getenv("DISCORD_TOKEN")
 if not TOKEN:
     raise RuntimeError("Missing DISCORD_TOKEN")
 
-def _env_int(name: str) -> int:
-    val = os.getenv(name)
-    if not val or not val.isdigit():
-        raise RuntimeError(f"Missing/invalid {name} in .env")
-    return int(val)
-
-CATEGORY_IRACING = _env_int("CATEGORY_IRACING")
-TRIGGER_IRACING = _env_int("TRIGGER_IRACING")
-
-CATEGORY_TRAINING = _env_int("CATEGORY_TRAINING")
-TRIGGER_TRAINING = _env_int("TRIGGER_TRAINING")
-
-CATEGORY_LIVE = _env_int("CATEGORY_LIVE")
-TRIGGER_LIVE = _env_int("TRIGGER_LIVE")
-
 DATA_PATH = Path("data.json")
 
-# ---- Your presets ----
-PRESETS_IRACING = [
-    "IRACING VOICE CHANNELS",
-    "stintONE Motorsport",
-    "stintONE Motorsport Black",
-    "stintONE Motorsport White",
-    "stintONE Motorsport Blue",
-    "stintONE Motorsport Gold",
-    "stintONE Motorsport Silver",
-]
+LIFETIME_SECONDS = 300  # 5 minutes
 
-PRESETS_TRAINING = [
-    "IRACING TRAINING AREA",
-    "Training",
-    "Training I",
-    "Training II",
-    "Training III",
-]
+GROUPS = {
+    "iracing": {
+        "label": "IRACING VOICE CHANNELS",
+        "category_id": _env_int("CATEGORY_IRACING"),
+        "panel_id": _env_int("PANEL_IRACING"),
+        "presets": [
+            "stintONE Motorsport",
+            "stintONE Motorsport Black",
+            "stintONE Motorsport White",
+            "stintONE Motorsport Blue",
+            "stintONE Motorsport Gold",
+            "stintONE Motorsport Silver",
+        ],
+    },
+    "training": {
+        "label": "IRACING TRAINING AREA",
+        "category_id": _env_int("CATEGORY_TRAINING"),
+        "panel_id": _env_int("PANEL_TRAINING"),
+        "presets": [
+            "Training",
+            "Training I",
+            "Training II",
+            "Training III",
+        ],
+    },
+    "live": {
+        "label": "LIVE ON STREAM",
+        "category_id": _env_int("CATEGORY_LIVE"),
+        "panel_id": _env_int("PANEL_LIVE"),
+        "presets": [
+            "stintONE Motorsport LIVE",
+            "stintONE Black LIVE",
+            "stintONE White LIVE",
+            "stintONE Blue LIVE",
+            "stintONE Gold LIVE",
+            "stintONE Silver LIVE",
+            "stintONE Rosé LIVE",
+        ],
+    },
+}
 
-PRESETS_LIVE = [
-    "LIVE ON STREAM",
-    "stintONE Motorsport LIVE",
-    "stintONE Black LIVE",
-    "stintONE White LIVE",
-    "stintONE Blue LIVE",
-    "stintONE Gold LIVE",
-    "stintONE Silver LIVE",
-    "stintONE Rosé LIVE",
-]
-
-# If you *don’t* want the header titles to be used as actual channel names, keep this True.
-SKIP_HEADERS = True
-DELETE_DELAY_SECONDS = 15.0
-
-HEADER_NAMES = {"IRACING VOICE CHANNELS", "IRACING TRAINING AREA", "LIVE ON STREAM"}
-
-
-@dataclass(frozen=True)
-class GroupConfig:
-    name: str
-    category_id: int
-    trigger_channel_id: int
-    presets: list[str]
-
-
-GROUPS: list[GroupConfig] = [
-    GroupConfig("iracing", CATEGORY_IRACING, TRIGGER_IRACING, PRESETS_IRACING),
-    GroupConfig("training", CATEGORY_TRAINING, TRIGGER_TRAINING, PRESETS_TRAINING),
-    GroupConfig("live", CATEGORY_LIVE, TRIGGER_LIVE, PRESETS_LIVE),
-]
-
-# ---- persistence ----
-def load_data() -> dict:
+def load_state() -> dict:
     if not DATA_PATH.exists():
-        return {"temp_channel_ids": [], "allocations": {}}  # allocations: channel_id -> preset_name
+        return {"channels": {}}  # channel_id -> {group_key, created_at, last_empty_at}
     try:
         return json.loads(DATA_PATH.read_text("utf-8"))
     except Exception:
-        return {"temp_channel_ids": [], "allocations": {}}
+        return {"channels": {}}
 
-def save_data(payload: dict) -> None:
-    DATA_PATH.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+def save_state(state: dict) -> None:
+    DATA_PATH.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
 
+state = load_state()
+tracked: Dict[str, Dict[str, Any]] = state.get("channels", {})  # keys are str(channel_id)
 
-state = load_data()
-temp_channel_ids: set[int] = set(state.get("temp_channel_ids", []))
-allocations: dict[str, str] = dict(state.get("allocations", {}))  # str(channel_id) -> preset_name
-delete_tasks: dict[int, asyncio.Task] = {}
+# channel_id -> asyncio.Task
+delete_tasks: Dict[int, asyncio.Task] = {}
 
-
-def persist():
-    save_data(
-        {
-            "temp_channel_ids": sorted(temp_channel_ids),
-            "allocations": allocations,
-        }
-    )
-
-
-# ---- discord ----
 intents = discord.Intents.default()
 intents.guilds = True
 intents.voice_states = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+def now_mono() -> float:
+    return asyncio.get_running_loop().time()
 
+def track_channel(channel_id: int, group_key: str, created_at: float):
+    tracked[str(channel_id)] = {
+        "group_key": group_key,
+        "created_at": created_at,
+        "last_empty_at": created_at,  # assume empty at creation; will update on join/leave events
+    }
+    state["channels"] = tracked
+    save_state(state)
 
-def group_for_trigger(channel_id: int) -> Optional[GroupConfig]:
-    for g in GROUPS:
-        if g.trigger_channel_id == channel_id:
-            return g
-    return None
+def untrack_channel(channel_id: int):
+    tracked.pop(str(channel_id), None)
+    state["channels"] = tracked
+    save_state(state)
 
+def get_track(channel_id: int) -> Optional[dict]:
+    return tracked.get(str(channel_id))
 
-def normalize_presets(presets: list[str]) -> list[str]:
-    if not SKIP_HEADERS:
-        return presets
-    return [p for p in presets if p not in HEADER_NAMES]
+def cancel_delete(channel_id: int):
+    t = delete_tasks.pop(channel_id, None)
+    if t and not t.done():
+        t.cancel()
 
-
-def active_preset_names_in_category(category: discord.CategoryChannel) -> set[str]:
-    names = set()
-    for ch in category.channels:
-        if isinstance(ch, discord.VoiceChannel):
-            names.add(ch.name)
-    return names
-
-
-async def schedule_delete_if_empty(channel: discord.VoiceChannel, delay: float = DELETE_DELAY_SECONDS):
-    if channel.id not in temp_channel_ids:
+async def schedule_delete(channel: discord.VoiceChannel):
+    info = get_track(channel.id)
+    if not info:
         return
-    if channel.id in delete_tasks:
-        return
-    if len(channel.members) > 0:
-        return
+
+    # Cancel any existing timer and create a fresh one.
+    cancel_delete(channel.id)
+
+    created_at = float(info.get("created_at", 0))
+    last_empty_at = float(info.get("last_empty_at", created_at))
+
+    # Delete at max(created+5min, empty+5min)
+    due = max(created_at + LIFETIME_SECONDS, last_empty_at + LIFETIME_SECONDS)
+    delay = max(0.0, due - now_mono())
 
     async def _runner():
         try:
             await asyncio.sleep(delay)
 
             fresh = channel.guild.get_channel(channel.id)
-            if fresh is None or not isinstance(fresh, discord.VoiceChannel):
-                # already deleted or not accessible
-                temp_channel_ids.discard(channel.id)
-                allocations.pop(str(channel.id), None)
-                persist()
+            if not fresh or not isinstance(fresh, discord.VoiceChannel):
+                untrack_channel(channel.id)
                 return
 
+            # Only delete if still empty at deletion time
             if len(fresh.members) > 0:
                 return
 
             try:
-                await fresh.delete(reason="Temp preset voice channel empty")
+                await fresh.delete(reason="Auto-delete temp voice channel (TTL)")
             except Exception:
                 return
 
-            temp_channel_ids.discard(channel.id)
-            allocations.pop(str(channel.id), None)
-            persist()
+            untrack_channel(channel.id)
         finally:
             delete_tasks.pop(channel.id, None)
 
     delete_tasks[channel.id] = asyncio.create_task(_runner())
 
+def used_voice_names(category: discord.CategoryChannel) -> set[str]:
+    return {c.name for c in category.channels if isinstance(c, discord.VoiceChannel)}
+
+# ---- UI ----
+class PresetButtonsView(discord.ui.View):
+    """Buttons for one category/group. One message per group in its panel channel."""
+    def __init__(self, group_key: str):
+        super().__init__(timeout=None)
+        self.group_key = group_key
+        g = GROUPS[group_key]
+        presets = g["presets"]
+
+        # Buttons: max 25 per message (we’re below that).
+        for preset in presets:
+            custom_id = f"create_vc:{group_key}:{preset}"
+            self.add_item(PresetButton(label=preset, custom_id=custom_id))
+
+class PresetButton(discord.ui.Button):
+    def __init__(self, label: str, custom_id: str):
+        super().__init__(label=label, style=discord.ButtonStyle.primary, custom_id=custom_id)
+
+    async def callback(self, interaction: discord.Interaction):
+        # custom_id format: create_vc:<group_key>:<preset_name>
+        try:
+            _, group_key, preset_name = self.custom_id.split(":", 2)
+        except Exception:
+            await interaction.response.send_message("Bad button config.", ephemeral=True)
+            return
+
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("Use this in a server.", ephemeral=True)
+            return
+
+        g = GROUPS.get(group_key)
+        if not g:
+            await interaction.response.send_message("Unknown group.", ephemeral=True)
+            return
+
+        category = guild.get_channel(g["category_id"])
+        if not isinstance(category, discord.CategoryChannel):
+            await interaction.response.send_message("Category ID is wrong or missing.", ephemeral=True)
+            return
+
+        # If exists already, do not create another.
+        existing = discord.utils.get(category.channels, name=preset_name)
+        if isinstance(existing, discord.VoiceChannel):
+            await interaction.response.send_message("That channel already exists.", ephemeral=True)
+            return
+
+        # Create channel, inherit category overwrites
+        try:
+            created = await guild.create_voice_channel(
+                name=preset_name,
+                category=category,
+                overwrites=dict(category.overwrites),
+                reason=f"Create preset voice channel ({group_key})",
+            )
+        except Exception as e:
+            await interaction.response.send_message(f"Create failed: {e!r}", ephemeral=True)
+            return
+
+        # Track and schedule deletion (5 min after creation unless occupied)
+        created_at = now_mono()
+        track_channel(created.id, group_key, created_at)
+
+        # If empty now, schedule delete at creation+5min
+        if len(created.members) == 0:
+            await schedule_delete(created)
+
+        await interaction.response.send_message(f"Created **{preset_name}**.", ephemeral=True)
+
+# ---- Bot ----
+class MyBot(commands.Bot):
+    async def setup_hook(self):
+        # Register persistent views (one per group)
+        self.group_views: Dict[str, PresetButtonsView] = {}
+        for group_key in GROUPS.keys():
+            v = PresetButtonsView(group_key)
+            self.group_views[group_key] = v
+            self.add_view(v)
+
+bot = MyBot(command_prefix="!", intents=intents)
+
+async def ensure_panel_message(panel: discord.TextChannel, group_key: str):
+    """Ensure the panel has a single bot message with the right buttons."""
+    # Try to find an existing bot message with components.
+    async for msg in panel.history(limit=50):
+        if msg.author == bot.user and msg.components:
+            # Keep it. (If you want strict matching, we can check custom_ids too.)
+            return
+
+    g = GROUPS[group_key]
+    await panel.send(
+        f"**{g['label']}**\n"
+        f"Click a button to create a voice channel.\n"
+        f"Channels auto-delete 5 minutes after creation or 5 minutes after they become empty.",
+        view=bot.group_views[group_key],
+    )
 
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} (id={bot.user.id})")
 
-    # Cleanup empty temp channels created earlier (after restart)
-    removed = False
+    # Ensure the button message exists in each panel channel
     for guild in bot.guilds:
-        for cid in list(temp_channel_ids):
-            ch = guild.get_channel(cid)
-            if ch is None:
-                temp_channel_ids.discard(cid)
-                allocations.pop(str(cid), None)
-                removed = True
-                continue
-            if isinstance(ch, discord.VoiceChannel) and len(ch.members) == 0:
+        for group_key, g in GROUPS.items():
+            panel = guild.get_channel(g["panel_id"])
+            if isinstance(panel, discord.TextChannel):
                 try:
-                    await ch.delete(reason="Cleanup empty temp channel after restart")
-                    temp_channel_ids.discard(cid)
-                    allocations.pop(str(cid), None)
-                    removed = True
+                    await ensure_panel_message(panel, group_key)
                 except Exception:
                     pass
 
-    if removed:
-        persist()
-
+    # Cleanup tracked channels that no longer exist
+    for guild in bot.guilds:
+        for channel_id_str in list(tracked.keys()):
+            cid = int(channel_id_str)
+            ch = guild.get_channel(cid)
+            if ch is None:
+                untrack_channel(cid)
+                continue
+            if isinstance(ch, discord.VoiceChannel) and len(ch.members) == 0:
+                # If empty, ensure it has a timer
+                await schedule_delete(ch)
 
 @bot.event
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
-    # If member left a channel, maybe delete it
-    if before.channel is not None and before.channel != after.channel:
-        if isinstance(before.channel, discord.VoiceChannel):
-            await schedule_delete_if_empty(before.channel)
+    # If someone joined a tracked temp channel, cancel deletion timer
+    if after.channel and isinstance(after.channel, discord.VoiceChannel):
+        info = get_track(after.channel.id)
+        if info:
+            # channel is occupied: cancel delete
+            cancel_delete(after.channel.id)
 
-    # If member joined a trigger, create a preset channel
-    if after.channel is None:
-        return
-
-    group = group_for_trigger(after.channel.id)
-    if not group:
-        return
-
-    if member.bot:
-        return
-
-    guild = member.guild
-    category = guild.get_channel(group.category_id)
-    if category is None or not isinstance(category, discord.CategoryChannel):
-        return
-
-    used_names = active_preset_names_in_category(category)
-    presets = normalize_presets(group.presets)
-
-    # Choose first free preset name that is not currently used as a voice channel name
-    chosen_name = None
-    for name in presets:
-        if name not in used_names:
-            chosen_name = name
-            break
-
-    if not chosen_name:
-        # No free preset available; optionally you could DM the user or move them back.
-        # For now: do nothing.
-        return
-
-    try:
-        created = await guild.create_voice_channel(
-            name=chosen_name,
-            category=category,
-            reason=f"Create preset temp voice channel ({group.name})",
-        )
-
-        temp_channel_ids.add(created.id)
-        allocations[str(created.id)] = chosen_name
-        persist()
-
-        await member.move_to(created, reason="Move to preset temp channel")
-    except Exception as e:
-        print("Failed to create/move:", repr(e))
-
+    # If someone left a tracked temp channel and it became empty, schedule deletion
+    if before.channel and isinstance(before.channel, discord.VoiceChannel):
+        info = get_track(before.channel.id)
+        if info:
+            ch = before.channel
+            if len(ch.members) == 0:
+                # Update last_empty_at and schedule delete
+                info["last_empty_at"] = now_mono()
+                save_state(state)
+                await schedule_delete(ch)
 
 bot.run(TOKEN)
